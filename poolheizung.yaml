@@ -7,30 +7,38 @@ esp32:
   framework:
     type: arduino
 
-# Enable Home Assistant API
 api:
   encryption:
-    key: ""
+    key: "gAX7GKwg9bIfVwcLAgB27vjqacrZXQ7q767Vcc8mw7o="
 
 ota:
   - platform: esphome
-    password: ""
+    password: "83c705431f2eec435658b05e3ac225ff"
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   output_power: 18.5dBm
   fast_connect: true
-  reboot_timeout: 30min  # Startet den ESP nach 30 Min ohne WLAN neu
-  # Enable fallback hotspot (captive portal) in case wifi connection fails
-#  ap:
-#    ssid: "Poolheizung Fallback Hotspot"
-#    password: "sBWLquQApba8"
 
+logger:
+  level: DEBUG 
+  baud_rate: 0
 
-captive_portal:
+globals:
+  - id: current_power_cmd
+    type: uint8_t
+    initial_value: '0x00'
+  - id: current_target_temp
+    type: uint8_t
+    initial_value: '25'
+  - id: current_mode_cmd
+    type: uint8_t
+    initial_value: '0x04' # 0x04 = Heizen, 0x01 = Kühlen
 
-# Definition der Sensoren für Home Assistant
+# ==========================================
+# 1. SENSOREN (Nur noch Temperaturen)
+# ==========================================
 sensor:
   - platform: template
     name: "Poolheizung Wassertemperatur"
@@ -40,7 +48,7 @@ sensor:
     device_class: temperature
 
   - platform: template
-    name: "Poolheizung Zieltemperatur"
+    name: "Poolheizung Zieltemperatur (Sensor)"
     id: pool_ziel_temp
     unit_of_measurement: "°C"
     accuracy_decimals: 0
@@ -62,35 +70,69 @@ sensor:
 
 binary_sensor:
   - platform: template
-    name: "Poolheizung Power"
+    name: "Poolheizung Power Status"
     id: pool_power_status
     device_class: power
 
-text_sensor:
-  - platform: template
-    name: "Poolheizung Modus"
-    id: pool_modus
-
+# ==========================================
+# 2. STEUERUNG (HA Dashboard Elemente)
+# ==========================================
 switch:
   - platform: template
-    name: "Poolheizung Power"
+    name: "Poolheizung"
     id: pool_power_switch
     icon: "mdi:pool-thermometer"
-    # Der Schalter zeigt den Status an, den wir von der Pumpe empfangen
     lambda: |-
       if (id(pool_power_status).state) return true;
       else return false;
-    # Wenn man in HA auf "An" drückt:
     turn_on_action:
-      - button.press: pumpe_ein_test
-    # Wenn man in HA auf "Aus" drückt:
+      - lambda: id(current_power_cmd) = 0x80;
+      - script.execute: fire_triple_shot
     turn_off_action:
-      - button.press: pumpe_aus_test
+      - lambda: id(current_power_cmd) = 0x00;
+      - script.execute: fire_triple_shot
 
-logger:
-  level: DEBUG 
-  baud_rate: 0
+number:
+  - platform: template
+    name: "Poolheizung Zieltemperatur"
+    id: pool_target_temp_input
+    min_value: 15
+    max_value: 40
+    step: 1
+    unit_of_measurement: "°C"
+    # Synchronisiert den Slider mit dem echten Wert der Pumpe
+    lambda: |-
+      if (id(pool_ziel_temp).has_state()) {
+        return id(pool_ziel_temp).state;
+      } else {
+        return 25.0; 
+      }
+    set_action:
+      - lambda: |-
+          id(current_target_temp) = (uint8_t)x;
+          ESP_LOGI("TX", "Slider auf %d geaendert. Warte 2s (Debounce)...", (int)x);
+      - script.execute: debounce_temp_send
 
+select:
+  - platform: template
+    name: "Poolheizung Modus"
+    id: pool_modus_select
+    options:
+      - "Heizen"
+      - "Kühlen"
+      - "Auto"
+    optimistic: true
+    set_action:
+      - lambda: |-
+          if (x == "Heizen") id(current_mode_cmd) = 0x04;
+          else if (x == "Kühlen") id(current_mode_cmd) = 0x01;
+          else if (x == "Auto") id(current_mode_cmd) = 0x00; // Platzhalter-Byte für Auto
+          ESP_LOGI("TX", "Modus auf %s geaendert. Feuere...", x.c_str());
+      - script.execute: fire_triple_shot
+
+# ==========================================
+# 3. DER EMPFÄNGER 
+# ==========================================
 remote_receiver:
   pin: 
     number: 18
@@ -125,109 +167,120 @@ remote_receiver:
               }
             }
 
-            // Wenn wir ein komplettes 23-Byte Paket haben:
             if (bytes.size() == 23) {
-              // 1. Modus (Byte 3 / Index 2)
-              if (bytes[2] == 0x04) id(pool_modus).publish_state("Heizen");
-              else if (bytes[2] == 0x01) id(pool_modus).publish_state("Kühlen");
-              else id(pool_modus).publish_state("Unbekannt");
+              // Modus-Dropdown synchronisieren
+              if (bytes[2] == 0x04) id(pool_modus_select).publish_state("Heizen");
+              else if (bytes[2] == 0x01) id(pool_modus_select).publish_state("Kühlen");
+              else if (bytes[2] == 0x00) id(pool_modus_select).publish_state("Auto");
 
-              // 2. Wassertemperatur (Byte 4 / Index 3)
               id(pool_wasser_temp).publish_state(bytes[3]);
-
-              // 3. Zieltemperatur (Byte 5 / Index 4)
               id(pool_ziel_temp).publish_state(bytes[4]);
-
-              // 4. Power Status (Byte 6 / Index 5)
-              id(pool_power_status).publish_state(bytes[5] > 0);
-
-              // 5. Außentemperatur (Byte 17 / Index 16)
               id(pool_aussen_temp).publish_state(bytes[16]);
-
-              // 6. Interne Temperatur (Byte 18 / Index 17)
               id(pool_intern_temp).publish_state(bytes[17]);
+              id(pool_power_status).publish_state(bytes[5] > 0);
+              
+              // Die internen TX-Variablen immer mit der Wahrheit der Pumpe synchronisieren
+              id(current_mode_cmd) = bytes[2];
+              id(current_target_temp) = bytes[4];
+              id(current_power_cmd) = (bytes[5] > 0) ? 0x80 : 0x00;
             }
           }
 
+# ==========================================
+# 4. DER SENDER & SKRIPTE
+# ==========================================
 remote_transmitter:
   pin: 
     number: 19
-    # Inverted true bedeutet: In Ruhephase ist die Leitung auf HIGH, wir ziehen sie für Pulse auf LOW.
     inverted: true
   carrier_duty_percent: 100
   id: pumpe_tx
 
-button:
-  - platform: template
-    name: "Pumpe EIN (Test)"
-    id: pumpe_ein_test
-    on_press:
-      - lambda: |-
-          ESP_LOGW("TX_SENDER", ">>> Berechne und feuere EIN-Befehl ab...");
-          auto call = id(pumpe_tx).transmit();
-          auto data = call.get_data();
-          data->set_carrier_frequency(0);
-          
-          // Unser Basis-Paket (mit der kühleren Temperatur 17, die die Pumpe gerade gemeldet hat)
-          // Wir setzen Byte 5 (Index 5) auf 0x01 für EIN!
-          uint8_t pkt[23] = {0xDD, 0x00, 0x04, 0x11, 0x19, 0x01, 0xF9, 0x0D, 0x2D, 0x03, 0x8F, 0x8D, 0x5F, 0x07, 0x01, 0x06, 0x0C, 0x17, 0x0B, 0x02, 0x19, 0x23, 0x00};
-          
-          // Magie: Prüfsumme live berechnen (Summe von Index 1 bis 21)
-          uint16_t sum = 0;
-          for (int i = 1; i <= 21; i++) {
-            sum += pkt[i];
-          }
-          pkt[22] = sum & 0xFF; // Modulo 256
-          
-          data->mark(9000);
-          data->space(4500);
+script:
+  # Dieses Skript fängt das "Frickeln" am Regler ab
+  - id: debounce_temp_send
+    mode: restart 
+    then:
+      - delay: 2s 
+      - logger.log: "Temperatur fertig eingestellt. Feuere Befehl..."
+      - script.execute: fire_triple_shot
 
-          for (int i=0; i<23; i++) {
-            for (int bit=0; bit<8; bit++) {
-              data->mark(1000);
-              if ((pkt[i] >> bit) & 1) { 
-                data->space(3000);
-              } else {
-                data->space(1000);
+  # Der eigentliche Abschuss
+  - id: fire_triple_shot
+    mode: single
+    then:
+      - lambda: |-
+          ESP_LOGI("TX", "Warte auf Pumpe (Anti-Noise Filter aktiv)...");
+          pinMode(18, INPUT_PULLUP);
+          uint32_t wait_start = millis();
+          uint32_t last_pulse = micros();
+          int pulse_count = 0;
+          bool was_low = false;
+          bool sync_ok = false;
+
+          while (millis() - wait_start < 3500) {
+            if (digitalRead(18) == LOW) {
+              last_pulse = micros();
+              if (!was_low) {
+                pulse_count++;
+                was_low = true;
+              }
+            } else {
+              was_low = false;
+            }
+
+            if (pulse_count > 10 && (micros() - last_pulse > 9920)) {
+              sync_ok = true;
+              break; 
+            }
+            yield(); 
+          }
+
+          if (!sync_ok) {
+            ESP_LOGE("TX", "Abbruch: Pumpe nicht gefunden oder nur Rauschen.");
+            return;
+          }
+
+          auto fire_payload = [&]() {
+            auto call = id(pumpe_tx).transmit();
+            auto data = call.get_data();
+            data->set_carrier_frequency(0);
+            
+            uint8_t pkt[17] = {0xCC, 0x19, 0x04, 0x00, 0xF9, 0x0D, 0x2D, 0x03, 0x8F, 0x8D, 0x5F, 0x07, 0x01, 0x06, 0x02, 0x23, 0x00};
+            
+            // Hier greifen wir auf die neuen Home Assistant Slider und Dropdowns zu!
+            pkt[1] = id(current_target_temp);
+            pkt[2] = id(current_mode_cmd);
+            pkt[3] = id(current_power_cmd);
+            
+            uint16_t sum = 0;
+            for (int i = 1; i < 16; i++) sum += pkt[i];
+            pkt[16] = sum & 0xFF;
+
+            data->mark(9170); 
+            data->space(4570); 
+            for (int i = 0; i < 17; i++) {
+              for (int bit = 0; bit < 8; bit++) {
+                data->mark(1010); 
+                if ((pkt[i] >> bit) & 1) data->space(3035); 
+                else data->space(1040); 
               }
             }
-          }
-          data->mark(1000); // Stopp-Puls
-          call.perform();
-          ESP_LOGW("TX_SENDER", ">>> EIN-Befehl erfolgreich gesendet!");
+            data->mark(1010);
+            call.perform(); 
+          };
 
-  - platform: template
-    name: "Pumpe AUS (Test)"
-    id: pumpe_aus_test
-    on_press:
-      - lambda: |-
-          ESP_LOGW("TX_SENDER", ">>> Berechne und feuere AUS-Befehl ab...");
-          auto call = id(pumpe_tx).transmit();
-          auto data = call.get_data();
-          data->set_carrier_frequency(0);
-          
-          // Byte 5 (Index 5) auf 0x00 für AUS
-          uint8_t pkt[23] = {0xDD, 0x00, 0x04, 0x11, 0x19, 0x00, 0xF9, 0x0D, 0x2D, 0x03, 0x8F, 0x8D, 0x5F, 0x07, 0x01, 0x06, 0x0C, 0x17, 0x0B, 0x02, 0x19, 0x23, 0x00};
-          
-          uint16_t sum = 0;
-          for (int i = 1; i <= 21; i++) {
-            sum += pkt[i];
-          }
-          pkt[22] = sum & 0xFF; 
-          
-          data->mark(9000);
-          data->space(4500);
+          ESP_LOGI("TX", "Sync perfekt! Schuss 1...");
+          fire_payload(); 
 
-          for (int i=0; i<23; i++) {
-            for (int bit=0; bit<8; bit++) {
-              data->mark(1000);
-              if ((pkt[i] >> bit) & 1) {
-                data->space(3000);
-              } else {
-                data->space(1000);
-              }
-            }
-          }
-          data->mark(1000); // Stopp-Puls
-          call.perform();
-          ESP_LOGW("TX_SENDER", ">>> AUS-Befehl erfolgreich gesendet!");
+          delay(711); 
+
+          ESP_LOGI("TX", "Schuss 2...");
+          fire_payload();
+
+          delay(1026); 
+
+          ESP_LOGI("TX", "Schuss 3...");
+          fire_payload();
+
+          ESP_LOGI("TX", "Triple-Fire erfolgreich beendet.");
